@@ -42,7 +42,13 @@ def list_context_tree(task: PublicTask, *, max_depth: int = 4) -> dict[str, obje
     }
 
 
-def read_csv_preview(task: PublicTask, relative_path: str, *, max_rows: int = 20) -> dict[str, object]:
+def read_csv_preview(
+    task: PublicTask,
+    relative_path: str,
+    *,
+    max_rows: int = 20,
+    offset: int = 0,
+) -> dict[str, object]:
     path = resolve_context_path(task, relative_path)
     with path.open(newline="") as handle:
         reader = csv.reader(handle)
@@ -54,34 +60,75 @@ def read_csv_preview(task: PublicTask, relative_path: str, *, max_rows: int = 20
             "columns": [],
             "rows": [],
             "row_count": 0,
+            "offset": 0,
         }
 
     header = rows[0]
     data_rows = rows[1:]
+    sliced = data_rows[offset : offset + max_rows]
     return {
         "path": relative_path,
         "columns": header,
-        "rows": data_rows[:max_rows],
+        "rows": sliced,
         "row_count": len(data_rows),
+        "offset": offset,
+        "returned": len(sliced),
     }
 
 
-def read_json_preview(task: PublicTask, relative_path: str, *, max_chars: int = 4000) -> dict[str, object]:
+def read_json_preview(
+    task: PublicTask,
+    relative_path: str,
+    *,
+    max_chars: int = 4000,
+    schema_only: bool = False,
+) -> dict[str, object]:
     path = resolve_context_path(task, relative_path)
     payload = json.loads(path.read_text())
+
+    if schema_only and isinstance(payload, list) and len(payload) > 0:
+        first = payload[0]
+        schema_info = {}
+        if isinstance(first, dict):
+            schema_info = {k: type(v).__name__ for k, v in first.items()}
+        return {
+            "path": relative_path,
+            "type": "array",
+            "length": len(payload),
+            "element_schema": schema_info,
+            "sample": payload[:3],
+        }
+
     preview = json.dumps(payload, ensure_ascii=False, indent=2)
-    return {
+    result: dict[str, object] = {
         "path": relative_path,
         "preview": preview[:max_chars],
         "truncated": len(preview) > max_chars,
     }
+    if isinstance(payload, list):
+        result["type"] = "array"
+        result["length"] = len(payload)
+    elif isinstance(payload, dict):
+        result["type"] = "object"
+        result["keys"] = list(payload.keys())[:50]
+    return result
 
 
-def read_doc_preview(task: PublicTask, relative_path: str, *, max_chars: int = 4000) -> dict[str, object]:
+def read_doc_preview(
+    task: PublicTask,
+    relative_path: str,
+    *,
+    max_chars: int = 4000,
+    offset: int = 0,
+) -> dict[str, object]:
     path = resolve_context_path(task, relative_path)
     text = path.read_text(errors="replace")
+    total_chars = len(text)
+    sliced = text[offset : offset + max_chars]
     return {
         "path": relative_path,
-        "preview": text[:max_chars],
-        "truncated": len(text) > max_chars,
+        "preview": sliced,
+        "total_chars": total_chars,
+        "offset": offset,
+        "truncated": (offset + max_chars) < total_chars,
     }

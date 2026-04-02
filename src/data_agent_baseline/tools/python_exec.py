@@ -82,6 +82,23 @@ def _run_python_code(
         "context_root": context_root,
         "Path": Path,
     }
+    try:
+        import pandas
+        namespace["pd"] = pandas
+        namespace["pandas"] = pandas
+    except ImportError:
+        pass
+    try:
+        import duckdb as _duckdb
+        namespace["duckdb"] = _duckdb
+    except ImportError:
+        pass
+    try:
+        import numpy
+        namespace["np"] = numpy
+        namespace["numpy"] = numpy
+    except ImportError:
+        pass
     resolved_stdout_path = Path(stdout_path)
     resolved_stderr_path = Path(stderr_path)
 

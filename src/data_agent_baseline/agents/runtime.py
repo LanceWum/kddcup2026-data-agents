@@ -15,6 +15,7 @@ class StepRecord:
     raw_response: str
     observation: dict[str, Any]
     ok: bool
+    trace_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -25,6 +26,8 @@ class AgentRuntimeState:
     steps: list[StepRecord] = field(default_factory=list)
     answer: AnswerTable | None = None
     failure_reason: str | None = None
+    retry_count: int = 0
+    plan: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +36,7 @@ class AgentRunResult:
     answer: AnswerTable | None
     steps: list[StepRecord]
     failure_reason: str | None
+    trace_id: str = ""
 
     @property
     def succeeded(self) -> bool:
@@ -41,6 +45,7 @@ class AgentRunResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id,
+            "trace_id": self.trace_id,
             "answer": self.answer.to_dict() if self.answer is not None else None,
             "steps": [step.to_dict() for step in self.steps],
             "failure_reason": self.failure_reason,

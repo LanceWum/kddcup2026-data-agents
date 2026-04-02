@@ -54,3 +54,16 @@ class AnswerTable:
             "columns": list(self.columns),
             "rows": [list(row) for row in self.rows],
         }
+
+    def validate(self) -> list[str]:
+        errors: list[str] = []
+        if not self.columns:
+            errors.append("columns must not be empty.")
+        if any(not isinstance(c, str) or not c.strip() for c in self.columns):
+            errors.append("All column names must be non-empty strings.")
+        if len(set(self.columns)) != len(self.columns):
+            errors.append("Duplicate column names detected.")
+        for i, row in enumerate(self.rows):
+            if len(row) != len(self.columns):
+                errors.append(f"Row {i} has {len(row)} values but expected {len(self.columns)} columns.")
+        return errors

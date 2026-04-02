@@ -24,6 +24,7 @@ CONFIGS_DIR = PROJECT_ROOT / "configs"
 DATA_DIR = PROJECT_ROOT / "data"
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 ARTIFACT_RUNS_DIR = ARTIFACTS_DIR / "runs"
+DEFAULT_GOLD_DIR = PROJECT_ROOT / "data" / "public" / "output"
 
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 console = Console()
@@ -145,6 +146,7 @@ def run_task_command(
 
     console.print(f"Run output: {run_output_dir}")
     console.print(f"Task output: {artifacts.task_output_dir}")
+    console.print(f"Trace ID: {artifacts.trace_id}")
     if artifacts.prediction_csv_path is not None:
         console.print(f"Prediction CSV: {artifacts.prediction_csv_path}")
     else:
@@ -157,11 +159,18 @@ def run_task_command(
 def run_benchmark_command(
     config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
     limit: int | None = typer.Option(None, min=1, help="Maximum number of tasks to run."),
+    difficulty: str | None = typer.Option(None, help="Filter tasks by difficulty level (easy/medium/hard/extreme)."),
 ) -> None:
     """Run the ReAct baseline on multiple tasks from the config selection."""
     app_config = load_app_config(config)
     dataset = DABenchPublicDataset(app_config.dataset.root_path)
-    task_total = len(dataset.iter_tasks())
+
+    if difficulty:
+        tasks_list = dataset.iter_tasks(difficulty=difficulty)
+    else:
+        tasks_list = dataset.iter_tasks()
+
+    task_total = len(tasks_list)
     if limit is not None:
         task_total = min(task_total, limit)
     effective_workers = app_config.run.max_workers
@@ -255,6 +264,122 @@ def run_benchmark_command(
     console.print(f"Run output: {run_output_dir}")
     console.print(f"Tasks attempted: {len(artifacts)}")
     console.print(f"Succeeded tasks: {sum(1 for item in artifacts if item.succeeded)}")
+
+
+@app.command("evaluate")
+def evaluate_command(
+    run_dir: Path = typer.Argument(..., help="Path to a run output directory (e.g. artifacts/runs/<run_id>)."),
+    gold_dir: Path = typer.Option(None, help="Path to gold output directory. Defaults to data/public/output."),
+) -> None:
+    """Evaluate predictions against gold answers."""
+    from data_agent_baseline.evaluation.evaluator import evaluate_run
+
+    effective_gold = gold_dir or DEFAULT_GOLD_DIR
+    if not run_dir.exists():
+        console.print(f"[red]Run directory not found: {run_dir}[/red]")
+        raise typer.Exit(1)
+
+    result = evaluate_run(run_dir, effective_gold)
+
+    table = Table(title="Evaluation Results")
+    table.add_column("Task ID")
+    table.add_column("Passed")
+    table.add_column("Message")
+    for tr in result.task_results:
+        status_str = "[green]PASS[/green]" if tr.passed else "[red]FAIL[/red]"
+        table.add_row(tr.task_id, status_str, tr.message)
+    console.print(table)
+    console.print(f"Total: {result.total} | Passed: {result.passed} | Failed: {result.failed} | Skipped: {result.skipped}")
+    console.print(f"Accuracy: {result.accuracy:.1%}")
+
+
+@app.command("register-failures")
+def register_failures_command(
+    summary_path: Path = typer.Argument(..., help="Path to summary.json from a benchmark run."),
+    config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
+) -> None:
+    """Import failed tasks from a summary.json into the failure registry."""
+    from data_agent_baseline.harness.failure_registry import FailureRegistry
+
+    app_config = load_app_config(config)
+    registry = FailureRegistry()
+    registry_path = app_config.harness.harness_dir / "failure_registry.json"
+    registry.load(registry_path)
+
+    count = registry.import_from_summary(summary_path)
+    registry.save(registry_path)
+
+    console.print(f"Imported {count} new failures from {summary_path}")
+    console.print(f"Total open failures: {len(registry.get_open_failures())}")
+    console.print(f"Registry saved to: {registry_path}")
+
+
+@app.command("run-regression")
+def run_regression_command(
+    config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
+) -> None:
+    """Run regression tests on all open failure cases."""
+    from data_agent_baseline.harness.failure_registry import FailureRegistry
+    from data_agent_baseline.harness.regression import RegressionRunner
+
+    app_config = load_app_config(config)
+    registry = FailureRegistry()
+    registry_path = app_config.harness.harness_dir / "failure_registry.json"
+    registry.load(registry_path)
+
+    open_count = len(registry.get_open_failures())
+    if open_count == 0:
+        console.print("[green]No open failures to test.[/green]")
+        return
+
+    console.print(f"Running regression on {open_count} open failures...")
+    runner = RegressionRunner()
+    report = runner.run(app_config, registry)
+
+    registry.save(registry_path)
+
+    table = Table(title=f"Regression Report (run_id={report.run_id})")
+    table.add_column("Category")
+    table.add_column("Count")
+    table.add_column("Tasks")
+    table.add_row("[green]Newly Fixed[/green]", str(len(report.newly_fixed)), ", ".join(report.newly_fixed) or "-")
+    table.add_row("[red]Still Failing[/red]", str(len(report.still_failing)), ", ".join(report.still_failing) or "-")
+    table.add_row("[yellow]Newly Broken[/yellow]", str(len(report.newly_broken)), ", ".join(report.newly_broken) or "-")
+    console.print(table)
+    console.print(f"Fix rate: {len(report.newly_fixed)}/{report.total_tested}")
+
+
+@app.command("regression-report")
+def regression_report_command(
+    config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
+) -> None:
+    """Show current failure registry status."""
+    from data_agent_baseline.harness.failure_registry import FailureRegistry
+
+    app_config = load_app_config(config)
+    registry = FailureRegistry()
+    registry_path = app_config.harness.harness_dir / "failure_registry.json"
+
+    if not registry_path.exists():
+        console.print("[yellow]No failure registry found. Run register-failures first.[/yellow]")
+        return
+
+    registry.load(registry_path)
+    open_failures = registry.get_open_failures()
+    resolved = [f for f in registry.failures if f.status == "resolved"]
+
+    table = Table(title="Failure Registry")
+    table.add_column("Task ID")
+    table.add_column("Difficulty")
+    table.add_column("Status")
+    table.add_column("Failure Reason")
+    table.add_column("First Seen")
+    for entry in registry.failures:
+        status_str = "[green]resolved[/green]" if entry.status == "resolved" else "[red]open[/red]"
+        reason = entry.failure_reason[:60] + "..." if len(entry.failure_reason) > 60 else entry.failure_reason
+        table.add_row(entry.task_id, entry.difficulty, status_str, reason, entry.first_seen_run_id)
+    console.print(table)
+    console.print(f"Open: {len(open_failures)} | Resolved: {len(resolved)} | Total: {len(registry.failures)}")
 
 
 def main() -> None:

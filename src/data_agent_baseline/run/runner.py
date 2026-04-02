@@ -13,6 +13,7 @@ from typing import Any
 
 from data_agent_baseline.agents.model import OpenAIModelAdapter
 from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
+from data_agent_baseline.agents.tracing import generate_trace_id, trace_log
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
 from data_agent_baseline.tools.registry import ToolRegistry, create_default_tool_registry
@@ -26,6 +27,7 @@ class TaskRunArtifacts:
     trace_path: Path
     succeeded: bool
     failure_reason: str | None
+    trace_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -35,6 +37,7 @@ class TaskRunArtifacts:
             "trace_path": str(self.trace_path),
             "succeeded": self.succeeded,
             "failure_reason": self.failure_reason,
+            "trace_id": self.trace_id,
         }
 
 
@@ -67,6 +70,9 @@ def build_model_adapter(config: AppConfig):
         api_base=config.agent.api_base,
         api_key=config.agent.api_key,
         temperature=config.agent.temperature,
+        max_retries=config.agent.max_retries,
+        request_timeout=config.agent.request_timeout,
+        connection_timeout=config.agent.connection_timeout,
     )
 
 
@@ -83,9 +89,10 @@ def _write_csv(path: Path, columns: list[str], rows: list[list[Any]]) -> None:
             writer.writerow(row)
 
 
-def _failure_run_result_payload(task_id: str, failure_reason: str) -> dict[str, Any]:
+def _failure_run_result_payload(task_id: str, failure_reason: str, trace_id: str = "") -> dict[str, Any]:
     return {
         "task_id": task_id,
+        "trace_id": trace_id,
         "answer": None,
         "steps": [],
         "failure_reason": failure_reason,
@@ -99,6 +106,7 @@ def _run_single_task_core(
     config: AppConfig,
     model=None,
     tools: ToolRegistry | None = None,
+    trace_id: str = "",
 ) -> dict[str, Any]:
     public_dataset = DABenchPublicDataset(config.dataset.root_path)
     task = public_dataset.get_task(task_id)
@@ -108,16 +116,18 @@ def _run_single_task_core(
         tools=tools or create_default_tool_registry(),
         config=ReActAgentConfig(max_steps=config.agent.max_steps),
     )
-    run_result = agent.run(task)
+    run_result = agent.run(task, trace_id=trace_id or None)
     return run_result.to_dict()
 
 
-def _run_single_task_in_subprocess(task_id: str, config: AppConfig, queue: multiprocessing.Queue[Any]) -> None:
+def _run_single_task_in_subprocess(
+    task_id: str, config: AppConfig, trace_id: str, queue: multiprocessing.Queue[Any],
+) -> None:
     try:
         queue.put(
             {
                 "ok": True,
-                "run_result": _run_single_task_core(task_id=task_id, config=config),
+                "run_result": _run_single_task_core(task_id=task_id, config=config, trace_id=trace_id),
             }
         )
     except BaseException as exc:  # noqa: BLE001
@@ -129,15 +139,15 @@ def _run_single_task_in_subprocess(task_id: str, config: AppConfig, queue: multi
         )
 
 
-def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[str, Any]:
+def _run_single_task_with_timeout(*, task_id: str, config: AppConfig, trace_id: str = "") -> dict[str, Any]:
     timeout_seconds = config.run.task_timeout_seconds
     if timeout_seconds <= 0:
-        return _run_single_task_core(task_id=task_id, config=config)
+        return _run_single_task_core(task_id=task_id, config=config, trace_id=trace_id)
 
     queue: multiprocessing.Queue[Any] = multiprocessing.Queue()
     process = multiprocessing.Process(
         target=_run_single_task_in_subprocess,
-        args=(task_id, config, queue),
+        args=(task_id, config, trace_id, queue),
     )
     process.start()
     process.join(timeout_seconds)
@@ -148,7 +158,7 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
         if process.is_alive():
             process.kill()
             process.join()
-        return _failure_run_result_payload(task_id, f"Task timed out after {timeout_seconds} seconds.")
+        return _failure_run_result_payload(task_id, f"Task timed out after {timeout_seconds} seconds.", trace_id)
 
     if queue.empty():
         exit_code = process.exitcode
@@ -156,13 +166,14 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
             return _failure_run_result_payload(
                 task_id,
                 f"Task exited unexpectedly with exit code {exit_code}.",
+                trace_id,
             )
-        return _failure_run_result_payload(task_id, "Task exited without returning a result.")
+        return _failure_run_result_payload(task_id, "Task exited without returning a result.", trace_id)
 
     result = queue.get()
     if result.get("ok"):
         return dict(result["run_result"])
-    return _failure_run_result_payload(task_id, f"Task failed with uncaught error: {result['error']}")
+    return _failure_run_result_payload(task_id, f"Task failed with uncaught error: {result['error']}", trace_id)
 
 
 def _write_task_outputs(task_id: str, run_output_dir: Path, run_result: dict[str, Any]) -> TaskRunArtifacts:
@@ -188,6 +199,7 @@ def _write_task_outputs(task_id: str, run_output_dir: Path, run_result: dict[str
         trace_path=trace_path,
         succeeded=bool(run_result.get("succeeded")),
         failure_reason=run_result.get("failure_reason"),
+        trace_id=run_result.get("trace_id", ""),
     )
 
 
@@ -199,13 +211,21 @@ def run_single_task(
     model=None,
     tools: ToolRegistry | None = None,
 ) -> TaskRunArtifacts:
+    trace_id = generate_trace_id()
+    trace_log(trace_id, "runner", f"Starting task {task_id}")
+
     started_at = perf_counter()
     if model is None and tools is None:
-        run_result = _run_single_task_with_timeout(task_id=task_id, config=config)
+        run_result = _run_single_task_with_timeout(task_id=task_id, config=config, trace_id=trace_id)
     else:
-        run_result = _run_single_task_core(task_id=task_id, config=config, model=model, tools=tools)
+        run_result = _run_single_task_core(task_id=task_id, config=config, model=model, tools=tools, trace_id=trace_id)
     run_result["e2e_elapsed_seconds"] = round(perf_counter() - started_at, 3)
-    return _write_task_outputs(task_id, run_output_dir, run_result)
+
+    artifact = _write_task_outputs(task_id, run_output_dir, run_result)
+    trace_log(trace_id, "runner",
+              f"Task {task_id} completed: {'ok' if artifact.succeeded else 'fail'} ({run_result['e2e_elapsed_seconds']}s)",
+              level="success" if artifact.succeeded else "warn")
+    return artifact
 
 
 def run_benchmark(

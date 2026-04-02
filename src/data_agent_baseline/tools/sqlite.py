@@ -21,10 +21,16 @@ def inspect_sqlite_schema(path: Path) -> dict[str, object]:
         ).fetchall()
         tables: list[dict[str, object]] = []
         for name, create_sql in rows:
+            try:
+                count_row = conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()
+                row_count = count_row[0] if count_row else 0
+            except Exception:
+                row_count = -1
             tables.append(
                 {
                     "name": name,
                     "create_sql": create_sql,
+                    "row_count": row_count,
                 }
             )
     return {
@@ -33,12 +39,15 @@ def inspect_sqlite_schema(path: Path) -> dict[str, object]:
     }
 
 
-def execute_read_only_sql(path: Path, sql: str, *, limit: int = 200) -> dict[str, object]:
+def execute_read_only_sql(
+    path: Path, sql: str, *, limit: int = 200, timeout_seconds: int = 30,
+) -> dict[str, object]:
     normalized_sql = sql.lstrip().lower()
     if not normalized_sql.startswith(("select", "with", "pragma")):
         raise ValueError("Only read-only SQL statements are allowed.")
 
     with _connect_read_only(path) as conn:
+        conn.execute(f"PRAGMA busy_timeout = {timeout_seconds * 1000}")
         cursor = conn.execute(sql)
         column_names = [item[0] for item in cursor.description or []]
         rows = cursor.fetchmany(limit + 1)

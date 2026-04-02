@@ -16,6 +16,10 @@ def _default_run_output_dir() -> Path:
     return PROJECT_ROOT / "artifacts" / "runs"
 
 
+def _default_harness_dir() -> Path:
+    return PROJECT_ROOT / "artifacts" / "harness"
+
+
 @dataclass(frozen=True, slots=True)
 class DatasetConfig:
     root_path: Path = field(default_factory=_default_dataset_root)
@@ -28,6 +32,9 @@ class AgentConfig:
     api_key: str = ""
     max_steps: int = 16
     temperature: float = 0.0
+    max_retries: int = 3
+    request_timeout: int = 120
+    connection_timeout: int = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,10 +46,17 @@ class RunConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class HarnessConfig:
+    harness_dir: Path = field(default_factory=_default_harness_dir)
+    auto_register_failures: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     run: RunConfig = field(default_factory=RunConfig)
+    harness: HarnessConfig = field(default_factory=HarnessConfig)
 
 
 def _path_value(raw_value: str | None, default_value: Path) -> Path:
@@ -59,10 +73,12 @@ def load_app_config(config_path: Path) -> AppConfig:
     dataset_defaults = DatasetConfig()
     agent_defaults = AgentConfig()
     run_defaults = RunConfig()
+    harness_defaults = HarnessConfig()
 
     dataset_payload = payload.get("dataset", {})
     agent_payload = payload.get("agent", {})
     run_payload = payload.get("run", {})
+    harness_payload = payload.get("harness", {})
 
     dataset_config = DatasetConfig(
         root_path=_path_value(dataset_payload.get("root_path"), dataset_defaults.root_path),
@@ -73,6 +89,9 @@ def load_app_config(config_path: Path) -> AppConfig:
         api_key=str(agent_payload.get("api_key", agent_defaults.api_key)),
         max_steps=int(agent_payload.get("max_steps", agent_defaults.max_steps)),
         temperature=float(agent_payload.get("temperature", agent_defaults.temperature)),
+        max_retries=int(agent_payload.get("max_retries", agent_defaults.max_retries)),
+        request_timeout=int(agent_payload.get("request_timeout", agent_defaults.request_timeout)),
+        connection_timeout=int(agent_payload.get("connection_timeout", agent_defaults.connection_timeout)),
     )
     raw_run_id = run_payload.get("run_id")
     run_id = run_defaults.run_id
@@ -86,4 +105,8 @@ def load_app_config(config_path: Path) -> AppConfig:
         max_workers=int(run_payload.get("max_workers", run_defaults.max_workers)),
         task_timeout_seconds=int(run_payload.get("task_timeout_seconds", run_defaults.task_timeout_seconds)),
     )
-    return AppConfig(dataset=dataset_config, agent=agent_config, run=run_config)
+    harness_config = HarnessConfig(
+        harness_dir=_path_value(harness_payload.get("harness_dir"), harness_defaults.harness_dir),
+        auto_register_failures=bool(harness_payload.get("auto_register_failures", harness_defaults.auto_register_failures)),
+    )
+    return AppConfig(dataset=dataset_config, agent=agent_config, run=run_config, harness=harness_config)
